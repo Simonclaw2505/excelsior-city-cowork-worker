@@ -1,0 +1,22 @@
+{
+  "name": "excelsior-cowork-worker",
+  "version": "1.0.0",
+  "description": "Cowork Worker — orchestrateur central Excelsior City",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "@supabase/supabase-js": "^2.49.0",
+    "axios": "^1.7.0",
+    "dotenv": "^16.4.0",
+    "express": "^4.18.0",
+    "stripe": "^16.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

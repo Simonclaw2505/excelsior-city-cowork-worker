@@ -96,7 +96,10 @@ pm2 save
       },
     },
     { headers: { Authorization: `Bearer ${HETZNER_API_KEY}` } }
-  );
+  ).catch(err => {
+    const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+    throw new Error(`Hetzner ${err.response?.status}: ${detail}`);
+  });
 
   const server = response.data.server;
   console.log(`✅ VPS créé: ${server.name} (ID: ${server.id})`);
@@ -256,7 +259,7 @@ Réponds UNIQUEMENT avec ce JSON :
 }`;
 
   const response = await anthropic.messages.create({
-    model: "claude-opus-4-6",
+    model: "claude-sonnet-4-6",
     max_tokens: 1500,
     messages: [{ role: "user", content: prompt }],
   });

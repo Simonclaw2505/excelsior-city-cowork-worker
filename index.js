@@ -84,9 +84,9 @@ pm2 save
     "https://api.hetzner.cloud/v1/servers",
     {
       name: `excelsior-${agent.name.toLowerCase()}`,
-      server_type: "cpx11",
-      image: "ubuntu-22.04",
-      location: "fsn1",
+      server_type: "cax11",
+      image: "ubuntu-24.04",
+      location: "hel1",
       ssh_keys: [parseInt(HETZNER_SSH_KEY_ID)],
       user_data: cloudInit,
       labels: {

@@ -25,7 +25,10 @@ const {
   HETZNER_SSH_KEY_ID,
   STRIPE_SECRET_KEY,
   GITHUB_TOKEN,
-  GITHUB_REPO = "excelsior-city/agent-runtime",
+  GITHUB_REPO = "Simonclaw2505/excelsior-city-agent-runtime",
+  MAILCOW_URL,
+  MAILCOW_API_KEY,
+  MAIL_DOMAIN = "excelsiorcity.dev",
   PORT = 3000,
 } = process.env;
 
@@ -179,13 +182,29 @@ async function provisionAgent(agentId) {
     console.error(`❌ Stripe erreur:`, e.message);
   }
 
-  // 3. Mettre à jour l'infrastructure dans Supabase
+  // 3. Mailbox Mailcow
+  try {
+    const mailbox = await provisionMailbox(agent);
+    if (mailbox) {
+      infrastructure.email = mailbox.email;
+      infrastructure.mailbox = {
+        smtp: mailbox.smtp,
+        imap: mailbox.imap,
+        password: mailbox.password,
+      };
+    }
+  } catch (e) {
+    errors.push(`Mailbox: ${e.message}`);
+    console.error(`❌ Mailbox erreur:`, e.message);
+  }
+
+  // 4. Mettre à jour l'infrastructure dans Supabase
   await supabase
     .from("agents")
     .update({ infrastructure })
     .eq("id", agentId);
 
-  // 4. Logger la naissance
+  // 5. Logger la naissance
   await log(agentId, "birth", `⚡ ${agent.symbol} ${agent.name} est né dans Excelsior City`, {
     metadata: { infrastructure, errors },
   });
@@ -201,6 +220,115 @@ async function provisionAgent(agentId) {
   if (errors.length > 0) console.warn(`⚠️ Erreurs:`, errors);
 
   return { success: true, agent: agent.name, infrastructure, errors };
+}
+
+// ─── MAIL SERVER PROVISIONING ─────────────────────────────────────────────────
+
+/**
+ * Crée le VPS central du serveur mail Mailcow
+ * À appeler une seule fois pour toute la ville
+ */
+async function provisionMailServer() {
+  console.log(`📧 Provisioning serveur mail Mailcow...`);
+
+  const cloudInit = `#!/bin/bash
+set -e
+exec > /var/log/mailcow-install.log 2>&1
+
+# Hostname
+hostnamectl set-hostname mail.${MAIL_DOMAIN}
+echo "127.0.0.1 mail.${MAIL_DOMAIN} mail" >> /etc/hosts
+
+# Docker
+curl -fsSL https://get.docker.com | bash
+systemctl enable docker
+systemctl start docker
+
+# Mailcow
+cd /opt
+git clone https://github.com/mailcow/mailcow-dockerized
+cd mailcow-dockerized
+
+# Config automatique
+echo "MAILCOW_HOSTNAME=mail.${MAIL_DOMAIN}" > .env.mailcow
+echo "DBPASS=$(openssl rand -base64 24)" >> .env.mailcow
+echo "DBROOT=$(openssl rand -base64 24)" >> .env.mailcow
+
+./generate_config.sh << CONF
+mail.${MAIL_DOMAIN}
+Europe/Brussels
+CONF
+
+# Pull et démarrer
+docker compose pull
+docker compose up -d
+
+echo "✅ Mailcow installé sur mail.${MAIL_DOMAIN}"
+`;
+
+  const response = await axios.post(
+    "https://api.hetzner.cloud/v1/servers",
+    {
+      name: "excelsior-mail",
+      server_type: "cax21",
+      image: "ubuntu-24.04",
+      location: "hel1",
+      ssh_keys: [parseInt(HETZNER_SSH_KEY_ID)],
+      user_data: cloudInit,
+      labels: { project: "excelsior", role: "mail-server" },
+    },
+    { headers: { Authorization: `Bearer ${HETZNER_API_KEY}` } }
+  ).catch(err => {
+    const detail = err.response?.data ? JSON.stringify(err.response.data) : err.message;
+    throw new Error(`Hetzner ${err.response?.status}: ${detail}`);
+  });
+
+  const server = response.data.server;
+  const ip = server.public_net?.ipv4?.ip;
+  console.log(`✅ Serveur mail créé: ${server.name} — IP: ${ip}`);
+
+  // Sauvegarder dans city_events
+  await cityEvent(
+    "milestone",
+    "📧 Serveur mail Excelsior City créé",
+    `Mailcow installé sur mail.${MAIL_DOMAIN} (IP: ${ip}). Configurer DNS OVH : MX + A + SPF + DKIM.`
+  );
+
+  return { server_id: server.id, ip, name: server.name };
+}
+
+/**
+ * Crée un mailbox agent dans Mailcow via API
+ * Appelé automatiquement à chaque naissance d'agent
+ */
+async function provisionMailbox(agent) {
+  if (!MAILCOW_URL || !MAILCOW_API_KEY) {
+    console.log(`⚠️ Mailcow non configuré (MAILCOW_URL/MAILCOW_API_KEY manquants) — mailbox ignoré`);
+    return null;
+  }
+
+  const localPart = agent.name.toLowerCase();
+  const password = `Excelsior_${agent.name}_${Math.random().toString(36).slice(2, 10)}!`;
+
+  const response = await axios.post(
+    `${MAILCOW_URL}/api/v1/add/mailbox`,
+    {
+      local_part: localPart,
+      domain: MAIL_DOMAIN,
+      name: `${agent.symbol} ${agent.name} — Excelsior City`,
+      password,
+      password2: password,
+      quota: "512",
+      active: "1",
+    },
+    { headers: { "X-API-Key": MAILCOW_API_KEY, "Content-Type": "application/json" } }
+  ).catch(err => {
+    throw new Error(`Mailcow: ${err.response?.data?.msg || err.message}`);
+  });
+
+  const email = `${localPart}@${MAIL_DOMAIN}`;
+  console.log(`✅ Mailbox créé: ${email}`);
+  return { email, password, smtp: `mail.${MAIL_DOMAIN}`, imap: `mail.${MAIL_DOMAIN}` };
 }
 
 // ─── ANALYSE DE SANTÉ ─────────────────────────────────────────────────────────
@@ -360,6 +488,33 @@ app.post("/market/refresh", async (req, res) => {
   try {
     await runMarketIntelligence();
     res.json({ success: true });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Endpoint: provisionner le serveur mail central (une seule fois)
+app.post("/provision/mail-server", async (req, res) => {
+  try {
+    const result = await provisionMailServer();
+    res.json({ success: true, ...result });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Endpoint: créer un mailbox pour un agent existant
+app.post("/agents/:agentId/mailbox", async (req, res) => {
+  try {
+    const { data: agent } = await supabase.from("agents").select("*").eq("id", req.params.agentId).single();
+    if (!agent) return res.status(404).json({ success: false, error: "Agent introuvable" });
+    const mailbox = await provisionMailbox(agent);
+    if (mailbox) {
+      await supabase.from("agents").update({
+        infrastructure: { ...agent.infrastructure, email: mailbox.email, mailbox }
+      }).eq("id", req.params.agentId);
+    }
+    res.json({ success: true, mailbox });
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }

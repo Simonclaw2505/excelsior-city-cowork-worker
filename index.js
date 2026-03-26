@@ -468,16 +468,6 @@ async function detectCollaborations() {
 
 // ─── ENDPOINTS HTTP (API interne) ─────────────────────────────────────────────
 
-// Endpoint: déclencher le provisioning d'un agent (appelé après naissance)
-app.post("/provision/:agentId", async (req, res) => {
-  try {
-    const result = await provisionAgent(req.params.agentId);
-    res.json(result);
-  } catch (e) {
-    res.status(500).json({ success: false, error: e.message });
-  }
-});
-
 // Endpoint: santé de Cowork
 app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString(), service: "cowork-worker" });
@@ -494,10 +484,21 @@ app.post("/market/refresh", async (req, res) => {
 });
 
 // Endpoint: provisionner le serveur mail central (une seule fois)
+// DOIT être avant /provision/:agentId pour ne pas être capturé par la route générique
 app.post("/provision/mail-server", async (req, res) => {
   try {
     const result = await provisionMailServer();
     res.json({ success: true, ...result });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Endpoint: déclencher le provisioning d'un agent (appelé après naissance)
+app.post("/provision/:agentId", async (req, res) => {
+  try {
+    const result = await provisionAgent(req.params.agentId);
+    res.json(result);
   } catch (e) {
     res.status(500).json({ success: false, error: e.message });
   }

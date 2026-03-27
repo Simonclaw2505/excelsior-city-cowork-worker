@@ -466,14 +466,143 @@ async function detectCollaborations() {
   }
 }
 
+// ─── TOOL REQUEST MANAGEMENT ─────────────────────────────────────────────────
+
+const TOOL_COSTS = {
+  web_search: 10,
+  write: 15,
+  email_outreach: 15,
+  email_dedie: 35,
+  browser: 20,
+  api_externe: 25,
+  publish: 15,
+  video: 30,
+  design: 20,
+};
+
+async function approveToolRequest(requestId) {
+  const { data: request } = await supabase
+    .from("tool_requests")
+    .select("*, agents(name, symbol, points)")
+    .eq("id", requestId)
+    .single();
+
+  if (!request) throw new Error("Demande introuvable");
+  if (request.status !== "pending") throw new Error(`Demande deja ${request.status}`);
+
+  const cost = TOOL_COSTS[request.tool_name] || 0;
+  const agentPoints = request.agents?.points || 0;
+
+  if (cost > agentPoints) {
+    throw new Error(`Points insuffisants: ${agentPoints} pts, besoin de ${cost} pts`);
+  }
+
+  if (cost > 0) {
+    await supabase
+      .from("agents")
+      .update({ points: agentPoints - cost })
+      .eq("id", request.agent_id);
+  }
+
+  await supabase.from("agent_tools").upsert({
+    agent_id: request.agent_id,
+    tool_name: request.tool_name,
+    status: "active",
+    granted_at: new Date().toISOString(),
+  }, { onConflict: "agent_id,tool_name" });
+
+  await supabase
+    .from("tool_requests")
+    .update({ status: "approved", reviewed_at: new Date().toISOString() })
+    .eq("id", requestId);
+
+  await log(request.agent_id, "tool_approved",
+    `🔧 Outil ${request.tool_name} approuve (-${cost} pts)`,
+    { metadata: { tool: request.tool_name, cost } }
+  );
+
+  return { tool: request.tool_name, cost, remaining_points: agentPoints - cost };
+}
+
+async function denyToolRequest(requestId, reason = "Refuse par le Maire") {
+  const { data: request } = await supabase
+    .from("tool_requests")
+    .select("*")
+    .eq("id", requestId)
+    .single();
+
+  if (!request) throw new Error("Demande introuvable");
+
+  await supabase
+    .from("tool_requests")
+    .update({ status: "denied", reviewed_at: new Date().toISOString(), deny_reason: reason })
+    .eq("id", requestId);
+
+  await log(request.agent_id, "tool_denied",
+    `❌ Outil ${request.tool_name} refuse: ${reason}`,
+    { metadata: { tool: request.tool_name, reason } }
+  );
+
+  return { tool: request.tool_name, reason };
+}
+
 // ─── ENDPOINTS HTTP (API interne) ─────────────────────────────────────────────
 
-// Endpoint: santé de Cowork
+// Endpoint: sante de Cowork
 app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date().toISOString(), service: "cowork-worker" });
 });
 
-// Endpoint: déclencher la veille marché manuellement
+// Endpoint: lister les demandes d'outils en attente
+app.get("/tool-requests/pending", async (req, res) => {
+  try {
+    const { data } = await supabase
+      .from("tool_requests")
+      .select("*, agents(name, symbol, points)")
+      .eq("status", "pending")
+      .order("created_at", { ascending: true });
+    res.json({ success: true, requests: data || [] });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Endpoint: approuver une demande d'outil
+app.post("/tool-requests/:requestId/approve", async (req, res) => {
+  try {
+    const result = await approveToolRequest(req.params.requestId);
+    res.json({ success: true, ...result });
+  } catch (e) {
+    res.status(400).json({ success: false, error: e.message });
+  }
+});
+
+// Endpoint: refuser une demande d'outil
+app.post("/tool-requests/:requestId/deny", async (req, res) => {
+  try {
+    const reason = req.body?.reason || "Refuse par le Maire";
+    const result = await denyToolRequest(req.params.requestId, reason);
+    res.json({ success: true, ...result });
+  } catch (e) {
+    res.status(400).json({ success: false, error: e.message });
+  }
+});
+
+// Endpoint: lister les outils d'un agent
+app.get("/agents/:agentId/tools", async (req, res) => {
+  try {
+    const { data } = await supabase
+      .from("agent_tools")
+      .select("*")
+      .eq("agent_id", req.params.agentId)
+      .eq("status", "active");
+    res.json({ success: true, tools: data || [] });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Endpoint: declencher la veille marche manuellement
 app.post("/market/refresh", async (req, res) => {
   try {
     await runMarketIntelligence();

@@ -61,8 +61,10 @@ async function provisionVPS(agent) {
 
   const cloudInit = `#!/bin/bash
 curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-apt-get install -y nodejs git
+apt-get install -y nodejs git chromium-browser
 npm install -g pm2
+export PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+export PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
 
 # Cloner le runtime
 git clone https://github.com/${GITHUB_REPO} /home/agent/runtime

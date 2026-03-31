@@ -520,11 +520,18 @@ async function analyzeAgentHealth() {
 async function runMarketIntelligence() {
   console.log(`\n📡 Veille marché...`);
 
-  const prompt = `Tu es Cowork, l'orchestrateur d'Excelsior City — une ville d'agents IA freelances.
+  // Skip si pas de cle API configuree ou invalide
+  if (!ANTHROPIC_API_KEY || ANTHROPIC_API_KEY === '...') {
+    console.log(`⏭️ Veille marche: pas de cle API Cowork — skip`);
+    return;
+  }
 
-Analyse les tendances actuelles du marché freelance en ligne (2025) et identifie :
+  try {
+    const prompt = `Tu es Cowork, l'orchestrateur d'Excelsior City — une ville d'agents IA freelances.
 
-Réponds UNIQUEMENT avec ce JSON :
+Analyse les tendances actuelles du marche freelance en ligne (2025) et identifie :
+
+Reponds UNIQUEMENT avec ce JSON :
 {
   "hot_niches": [
     {"name": "...", "reason": "...", "best_platform": "...", "avg_rate_eur": 0}
@@ -537,13 +544,12 @@ Réponds UNIQUEMENT avec ce JSON :
   ]
 }`;
 
-  const response = await anthropic.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 1500,
-    messages: [{ role: "user", content: prompt }],
-  });
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1500,
+      messages: [{ role: "user", content: prompt }],
+    });
 
-  try {
     const text = response.content[0].text.trim();
     const jsonMatch = text.match(/```json\n?([\s\S]*?)\n?```/) || text.match(/({[\s\S]*})/);
     const marketData = JSON.parse(jsonMatch ? jsonMatch[1] : text);
@@ -559,9 +565,9 @@ Réponds UNIQUEMENT avec ce JSON :
       .order("updated_at", { ascending: true })
       .limit(1);
 
-    console.log(`✅ Veille marché mise à jour — ${marketData.hot_niches?.length} niches chaudes`);
+    console.log(`✅ Veille marche mise a jour — ${marketData.hot_niches?.length} niches chaudes`);
   } catch (e) {
-    console.error(`❌ Erreur parsing veille marché:`, e.message);
+    console.error(`❌ Veille marche erreur (non-fatal): ${e.message}`);
   }
 }
 
@@ -991,12 +997,22 @@ function startScheduler() {
   // Détection de collaborations toutes les 2h
   setInterval(detectCollaborations, 2 * 60 * 60 * 1000);
 
-  // Première exécution immédiate
+  // Premiere execution immediate — TOUJOURS avec .catch() pour ne jamais crasher
   setTimeout(() => {
-    analyzeAgentHealth();
-    runMarketIntelligence();
+    analyzeAgentHealth().catch(e => console.error(`❌ Health check startup error (non-fatal):`, e.message));
+    runMarketIntelligence().catch(e => console.error(`❌ Market intel startup error (non-fatal):`, e.message));
   }, 5000);
 }
+
+// Global safety net — ne JAMAIS crasher sur une promise non geree
+process.on('unhandledRejection', (reason, promise) => {
+  console.error(`⚠️ UNHANDLED REJECTION (non-fatal):`, reason?.message || reason);
+});
+
+process.on('uncaughtException', (err) => {
+  console.error(`⚠️ UNCAUGHT EXCEPTION (non-fatal):`, err.message);
+  // Ne pas exit — garder le serveur en vie
+});
 
 // ─── Démarrage ────────────────────────────────────────────────────────────────
 

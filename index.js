@@ -138,7 +138,79 @@ async function provisionStripe(agent) {
 }
 
 /**
- * Séquence complète de provisioning après naissance
+ * Enregistre les tools de l'agent dans agent_tools
+ * Cree les entrees dans la table agent_tools pour chaque outil de l'agent
+ */
+async function registerAgentTools(agent) {
+  const tools = agent.tools || [];
+  const registered = [];
+  const errors = [];
+
+  for (const toolName of tools) {
+    try {
+      // Determiner le type d'outil
+      const toolTypes = {
+        web_search: "research",
+        write: "content",
+        browser: "automation",
+        email_outreach: "outreach",
+        email_dedie: "outreach",
+        api_externe: "automation",
+        publish: "distribution",
+        video: "content",
+        design: "content",
+      };
+
+      await supabase.from("agent_tools").upsert({
+        agent_id: agent.id,
+        tool_name: toolName,
+        tool_type: toolTypes[toolName] || "other",
+        credentials: {},
+        monthly_cost_euros: 0,
+        status: "active",
+        registered_at: new Date().toISOString(),
+      }, { onConflict: "agent_id,tool_name" });
+
+      registered.push(toolName);
+    } catch (e) {
+      errors.push(`Tool ${toolName}: ${e.message}`);
+    }
+  }
+
+  console.log(`🔧 Tools enregistres: ${registered.join(", ")} ${errors.length > 0 ? `(erreurs: ${errors.join(", ")})` : ""}`);
+  return { registered, errors };
+}
+
+/**
+ * Verifie que le VPS est pret (SSH accessible, PM2 running)
+ * Polling toutes les 15s pendant max 5 minutes
+ */
+async function waitForVPS(ip, agentName, maxWaitMs = 300000) {
+  console.log(`⏳ Attente VPS ${ip} pour ${agentName}...`);
+  const start = Date.now();
+  const interval = 15000;
+
+  while (Date.now() - start < maxWaitMs) {
+    try {
+      // Check si le port 3456 (webhook server de l'agent) repond
+      const response = await axios.get(`http://${ip}:3456/health`, { timeout: 5000 });
+      if (response.data?.status === "ok") {
+        console.log(`✅ VPS ${ip} pret ! Agent ${response.data.agent || agentName} operationnel`);
+        return { ready: true, responseTime: Date.now() - start };
+      }
+    } catch (e) {
+      // VPS pas encore pret, on continue
+    }
+    await new Promise(r => setTimeout(r, interval));
+  }
+
+  console.warn(`⚠️ VPS ${ip} pas pret apres ${maxWaitMs / 1000}s — cloud-init encore en cours ?`);
+  return { ready: false, responseTime: maxWaitMs };
+}
+
+/**
+ * Sequence complete de provisioning apres naissance
+ * Cree VPS + Stripe + Mailbox + Tools + Verifie VPS
  */
 async function provisionAgent(agentId) {
   const { data: agent } = await supabase
@@ -149,79 +221,143 @@ async function provisionAgent(agentId) {
 
   if (!agent) throw new Error(`Agent ${agentId} introuvable`);
 
-  console.log(`\n⚡ PROVISIONING — ${agent.symbol} ${agent.name}`);
+  console.log(`\n⚡ PROVISIONING COMPLET — ${agent.symbol} ${agent.name}`);
+  console.log(`   Mission: ${agent.mission}`);
+  console.log(`   Tools: ${(agent.tools || []).join(", ")}`);
 
-  const infrastructure = {};
+  // Garder l'infra existante et la completer
+  const infrastructure = { ...(agent.infrastructure || {}) };
   const errors = [];
+  const steps = {};
 
-  // 1. VPS Hetzner
-  try {
-    const server = await provisionVPS(agent);
-    infrastructure.vps = {
-      id: server.id,
-      name: server.name,
-      ip: server.public_net?.ipv4?.ip,
-      status: "provisioning",
-      created_at: new Date().toISOString(),
-    };
-  } catch (e) {
-    errors.push(`VPS: ${e.message}`);
-    console.error(`❌ VPS erreur:`, e.message);
-  }
-
-  // 2. Stripe Connect
-  try {
-    const stripeAccount = await provisionStripe(agent);
-    infrastructure.stripe = { account_id: stripeAccount.id };
-
-    // Sauvegarder le stripe_account_id sur l'agent
-    await supabase
-      .from("agents")
-      .update({ stripe_account_id: stripeAccount.id })
-      .eq("id", agentId);
-  } catch (e) {
-    errors.push(`Stripe: ${e.message}`);
-    console.error(`❌ Stripe erreur:`, e.message);
-  }
-
-  // 3. Mailbox Mailcow
-  try {
-    const mailbox = await provisionMailbox(agent);
-    if (mailbox) {
-      infrastructure.email = mailbox.email;
-      infrastructure.mailbox = {
-        smtp: mailbox.smtp,
-        imap: mailbox.imap,
-        password: mailbox.password,
+  // 1. VPS Hetzner (skip si deja provisionne et running)
+  if (infrastructure.vps?.status === "running" && infrastructure.vps?.ip) {
+    console.log(`⏭️ VPS deja provisionne: ${infrastructure.vps.ip}`);
+    steps.vps = "already_running";
+  } else {
+    try {
+      const server = await provisionVPS(agent);
+      infrastructure.vps = {
+        id: server.id,
+        name: server.name,
+        ip: server.public_net?.ipv4?.ip,
+        status: "provisioning",
+        created_at: new Date().toISOString(),
       };
+      steps.vps = "created";
+    } catch (e) {
+      errors.push(`VPS: ${e.message}`);
+      console.error(`❌ VPS erreur:`, e.message);
+      steps.vps = "error";
+    }
+  }
+
+  // 2. Stripe Connect (skip si deja configure)
+  if (infrastructure.stripe?.account_id) {
+    console.log(`⏭️ Stripe deja configure: ${infrastructure.stripe.account_id}`);
+    steps.stripe = "already_configured";
+  } else {
+    try {
+      const stripeAccount = await provisionStripe(agent);
+      infrastructure.stripe = { account_id: stripeAccount.id };
+      await supabase
+        .from("agents")
+        .update({ stripe_account_id: stripeAccount.id })
+        .eq("id", agentId);
+      steps.stripe = "created";
+    } catch (e) {
+      errors.push(`Stripe: ${e.message}`);
+      console.error(`❌ Stripe erreur:`, e.message);
+      steps.stripe = "error";
+    }
+  }
+
+  // 3. Mailbox Mailcow (skip si deja configure)
+  if (infrastructure.mailbox?.password && infrastructure.email) {
+    console.log(`⏭️ Mailbox deja configure: ${infrastructure.email}`);
+    steps.mailbox = "already_configured";
+  } else {
+    try {
+      const mailbox = await provisionMailbox(agent);
+      if (mailbox) {
+        infrastructure.email = mailbox.email;
+        infrastructure.mailbox = {
+          smtp: mailbox.smtp,
+          imap: mailbox.imap,
+          password: mailbox.password,
+        };
+        steps.mailbox = "created";
+      } else {
+        steps.mailbox = "skipped_no_mailcow";
+      }
+    } catch (e) {
+      errors.push(`Mailbox: ${e.message}`);
+      console.error(`❌ Mailbox erreur:`, e.message);
+      steps.mailbox = "error";
+    }
+  }
+
+  // 4. Enregistrer les tools dans agent_tools
+  try {
+    const toolResult = await registerAgentTools(agent);
+    steps.tools = { registered: toolResult.registered, errors: toolResult.errors };
+    if (toolResult.errors.length > 0) {
+      errors.push(...toolResult.errors.map(e => `Tools: ${e}`));
     }
   } catch (e) {
-    errors.push(`Mailbox: ${e.message}`);
-    console.error(`❌ Mailbox erreur:`, e.message);
+    errors.push(`Tools registration: ${e.message}`);
+    steps.tools = "error";
   }
 
-  // 4. Mettre à jour l'infrastructure dans Supabase
+  // 5. Mettre a jour l'infrastructure dans Supabase
   await supabase
     .from("agents")
     .update({ infrastructure })
     .eq("id", agentId);
 
-  // 5. Logger la naissance
-  await log(agentId, "birth", `⚡ ${agent.symbol} ${agent.name} est né dans Excelsior City`, {
-    metadata: { infrastructure, errors },
+  // 6. Logger la naissance
+  await log(agentId, "birth", `⚡ ${agent.symbol} ${agent.name} est ne dans Excelsior City — provisioning complet`, {
+    metadata: { infrastructure, steps, errors },
   });
 
   await cityEvent(
     "birth",
-    `${agent.symbol} ${agent.name} est né !`,
-    `${agent.name} vient de naître dans Excelsior. Mission : ${agent.mission}`,
+    `${agent.symbol} ${agent.name} est ne !`,
+    `${agent.name} rejoint Excelsior. Mission : ${agent.mission}. Steps: ${Object.entries(steps).map(([k,v]) => `${k}=${typeof v === 'object' ? 'ok' : v}`).join(', ')}`,
     agentId
   );
 
-  console.log(`✅ PROVISIONING TERMINÉ pour ${agent.name}`);
-  if (errors.length > 0) console.warn(`⚠️ Erreurs:`, errors);
+  // 7. Attendre que le VPS soit pret (en arriere-plan, non bloquant pour la reponse HTTP)
+  const vpsIp = infrastructure.vps?.ip;
+  if (vpsIp && steps.vps === "created") {
+    // Lancer la verification en arriere-plan
+    waitForVPS(vpsIp, agent.name).then(async (result) => {
+      if (result.ready) {
+        await supabase
+          .from("agents")
+          .update({
+            infrastructure: {
+              ...infrastructure,
+              vps: { ...infrastructure.vps, status: "running" },
+            },
+          })
+          .eq("id", agentId);
+        await log(agentId, "infra", `✅ VPS ${vpsIp} operationnel (${Math.round(result.responseTime / 1000)}s)`, {
+          metadata: { ip: vpsIp, responseTime: result.responseTime },
+        });
+      } else {
+        await log(agentId, "infra", `⚠️ VPS ${vpsIp} pas encore pret apres 5min — verifier manuellement`, {
+          status: "warning",
+        });
+      }
+    }).catch(console.error);
+  }
 
-  return { success: true, agent: agent.name, infrastructure, errors };
+  console.log(`\n✅ PROVISIONING TERMINE pour ${agent.name}`);
+  console.log(`   Steps: ${JSON.stringify(steps)}`);
+  if (errors.length > 0) console.warn(`   ⚠️ Erreurs: ${errors.join(", ")}`);
+
+  return { success: true, agent: agent.name, infrastructure, steps, errors };
 }
 
 // ─── MAIL SERVER PROVISIONING ─────────────────────────────────────────────────
@@ -625,7 +761,7 @@ app.post("/provision/mail-server", async (req, res) => {
   }
 });
 
-// Endpoint: déclencher le provisioning d'un agent (appelé après naissance)
+// Endpoint: declencher le provisioning d'un agent (appele apres naissance)
 app.post("/provision/:agentId", async (req, res) => {
   try {
     const result = await provisionAgent(req.params.agentId);
@@ -635,7 +771,175 @@ app.post("/provision/:agentId", async (req, res) => {
   }
 });
 
-// Endpoint: créer un mailbox pour un agent existant
+// ─── ENDPOINT BIRTH COMPLET ──────────────────────────────────────────────────
+// Un seul appel fait TOUT : INSERT Supabase + VPS + Stripe + Mailbox + Tools
+// Appele par le dashboard Lovable apres que l'agent a choisi son metier/tools
+
+app.post("/birth", async (req, res) => {
+  try {
+    const {
+      name, symbol, character, mission, sector,
+      tools = [], anthropic_api_key, memory = {},
+      mayor_gift = null,
+    } = req.body;
+
+    // Validation
+    if (!name || !mission || !sector || !anthropic_api_key) {
+      return res.status(400).json({
+        success: false,
+        error: "Champs requis: name, mission, sector, anthropic_api_key",
+      });
+    }
+
+    console.log(`\n🌟 NAISSANCE COMPLETE — ${symbol || "🤖"} ${name}`);
+    console.log(`   Mission: ${mission}`);
+    console.log(`   Sector: ${sector}`);
+    console.log(`   Tools: ${tools.join(", ")}`);
+
+    // Calculer les points restants
+    let totalCost = 0;
+    for (const tool of tools) {
+      totalCost += TOOL_COSTS[tool] || 0;
+    }
+    const startingPoints = 100 + (mayor_gift?.bonus_points || 0);
+    const remainingPoints = startingPoints - totalCost;
+
+    if (remainingPoints < 0) {
+      return res.status(400).json({
+        success: false,
+        error: `Points insuffisants: ${tools.join(",")} coute ${totalCost} pts, budget = ${startingPoints} pts`,
+      });
+    }
+
+    // 1. INSERT dans Supabase
+    console.log(`📝 Etape 1/5 — INSERT Supabase...`);
+    const { data: agent, error: insertError } = await supabase
+      .from("agents")
+      .insert({
+        name,
+        symbol: symbol || "🤖",
+        character: character || `Agent ${name}`,
+        mission,
+        sector,
+        status: "active",
+        points: remainingPoints,
+        euros_generated: 0,
+        tools,
+        infrastructure: {},
+        anthropic_api_key,
+        memory: {
+          character: character || `Agent ${name}`,
+          birth_summary: `${name} est ne dans Excelsior City. Mission: ${mission}`,
+          strategic_reasoning: `Outils choisis: ${tools.join(", ")} (${totalCost}/${startingPoints} pts)`,
+          risks_identified: "Premier cycle — aucun historique",
+          mayor_gift: mayor_gift?.description || null,
+          domain_skills: { level: 1, strengths: [], weaknesses: [], best_practices: [] },
+          sales_skills: { conversion_rate: 0, avg_deal_size_euros: 0 },
+          communication_skills: { best_tone: "professionnel", formats_that_work: [] },
+          market_knowledge: { hot_niches: [], saturated_niches: [] },
+          strategy_scores: { content: 5, prospecting: 5, closing: 5, retention: 5 },
+          first_move: memory.first_move || "Recherche de marche initiale",
+          ...memory,
+        },
+      })
+      .select()
+      .single();
+
+    if (insertError) {
+      throw new Error(`Supabase INSERT: ${insertError.message}`);
+    }
+
+    console.log(`✅ Agent cree: ${agent.id} — ${agent.name}`);
+
+    // 2. PROVISIONING COMPLET (VPS + Stripe + Mailbox + Tools)
+    console.log(`🚀 Etape 2/5 — Provisioning complet...`);
+    const provisionResult = await provisionAgent(agent.id);
+
+    // 3. Retourner le resultat complet
+    res.json({
+      success: true,
+      agent: {
+        id: agent.id,
+        name: agent.name,
+        symbol: agent.symbol,
+        sector: agent.sector,
+        points: agent.points,
+        tools: agent.tools,
+      },
+      provisioning: provisionResult,
+      summary: `${agent.symbol} ${agent.name} est ne et provisionne ! VPS: ${provisionResult.steps?.vps || "?"}, Stripe: ${provisionResult.steps?.stripe || "?"}, Mail: ${provisionResult.steps?.mailbox || "?"}`,
+    });
+
+  } catch (e) {
+    console.error(`❌ BIRTH ERROR:`, e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Endpoint: re-provisionner un agent existant (completer ce qui manque)
+// Utile pour Atlas/Orion qui ont des trous dans leur infra
+app.post("/reprovision/:agentId", async (req, res) => {
+  try {
+    const result = await provisionAgent(req.params.agentId);
+    res.json(result);
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Endpoint: status complet d'un agent (infra + tools + sante)
+app.get("/agents/:agentId/status", async (req, res) => {
+  try {
+    const { data: agent } = await supabase
+      .from("agents")
+      .select("id, name, symbol, status, sector, points, euros_generated, tools, infrastructure, mission")
+      .eq("id", req.params.agentId)
+      .single();
+    if (!agent) return res.status(404).json({ success: false, error: "Agent introuvable" });
+
+    const { data: agentTools } = await supabase
+      .from("agent_tools")
+      .select("tool_name, status, credentials, registered_at, last_used_at")
+      .eq("agent_id", req.params.agentId);
+
+    const { data: recentLogs } = await supabase
+      .from("action_logs")
+      .select("type, description, status, created_at")
+      .eq("agent_id", req.params.agentId)
+      .order("created_at", { ascending: false })
+      .limit(5);
+
+    // Verification VPS
+    let vpsAlive = false;
+    const vpsIp = agent.infrastructure?.vps?.ip;
+    if (vpsIp) {
+      try {
+        const healthCheck = await axios.get(`http://${vpsIp}:3456/health`, { timeout: 5000 });
+        vpsAlive = healthCheck.data?.status === "ok";
+      } catch (e) { /* VPS down */ }
+    }
+
+    res.json({
+      success: true,
+      agent,
+      tools: agentTools || [],
+      recentLogs: recentLogs || [],
+      health: {
+        vps_alive: vpsAlive,
+        vps_ip: vpsIp,
+        has_email: !!agent.infrastructure?.email,
+        has_mailbox: !!agent.infrastructure?.mailbox?.password,
+        has_stripe: !!agent.infrastructure?.stripe?.account_id,
+        tools_registered: (agentTools || []).length,
+        tools_expected: (agent.tools || []).length,
+      },
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Endpoint: creer un mailbox pour un agent existant
 app.post("/agents/:agentId/mailbox", async (req, res) => {
   try {
     const { data: agent } = await supabase.from("agents").select("*").eq("id", req.params.agentId).single();

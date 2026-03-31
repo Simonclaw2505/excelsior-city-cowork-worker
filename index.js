@@ -230,10 +230,23 @@ async function provisionAgent(agentId) {
   const errors = [];
   const steps = {};
 
-  // 1. VPS Hetzner (skip si deja provisionne et running)
-  if (infrastructure.vps?.status === "running" && infrastructure.vps?.ip) {
-    console.log(`⏭️ VPS deja provisionne: ${infrastructure.vps.ip}`);
-    steps.vps = "already_running";
+  // 1. VPS Hetzner (skip si deja provisionne — meme en status "provisioning")
+  if (infrastructure.vps?.ip) {
+    // VPS existe deja — verifier s'il repond
+    console.log(`⏭️ VPS deja provisionne: ${infrastructure.vps.ip} (status: ${infrastructure.vps.status})`);
+    try {
+      const check = await axios.get(`http://${infrastructure.vps.ip}:3456/health`, { timeout: 5000 });
+      if (check.data?.status === "ok") {
+        infrastructure.vps.status = "running";
+        steps.vps = "already_running";
+        console.log(`✅ VPS confirme running`);
+      } else {
+        steps.vps = "exists_not_ready";
+      }
+    } catch (e) {
+      steps.vps = "exists_not_responding";
+      console.log(`⚠️ VPS ${infrastructure.vps.ip} ne repond pas sur :3456 — garder tel quel`);
+    }
   } else {
     try {
       const server = await provisionVPS(agent);
